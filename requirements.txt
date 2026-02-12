@@ -1,0 +1,41 @@
+# API
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+# Database
+sqlalchemy==2.0.35
+alembic==1.13.2
+psycopg2-binary==2.9.9
+
+# Task Queue
+celery[redis]==5.4.0
+redis==5.1.1
+
+# ML / Training
+torch>=2.1.0
+transformers==4.45.0
+peft==0.13.0
+datasets==3.0.1
+accelerate==0.34.2
+bitsandbytes==0.44.0
+trl==0.11.1
+sentencepiece==0.2.0
+
+# Storage
+minio==7.2.8
+boto3==1.35.19
+
+# Inference
+# vllm==0.6.1  # Uncomment for production GPU serving
+
+# Monitoring
+prometheus-client==0.21.0
+prometheus-fastapi-instrumentator==7.0.0
+
+# Utilities
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+httpx==0.27.2
+loguru==0.7.2
