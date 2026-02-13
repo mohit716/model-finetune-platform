@@ -12,6 +12,9 @@ venv/
 data/
 *.db
 
+# Local Redis build (no sudo)
+redis-build/
+
 # Environment
 .env
 

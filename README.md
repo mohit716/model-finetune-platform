@@ -30,7 +30,16 @@ An open-source replica of Amazon SageMaker's fine-tuning infrastructure.
 docker-compose up --build
 ```
 
-### Option 2: Local Development
+### Option 2: One command (API + Celery + Redis)
+If you already have `.venv` and Redis built (see Option 3), run everything with one script. Stopping it (Ctrl+C) stops both the API and the Celery worker.
+
+```bash
+./scripts/run-all.sh
+```
+
+Then use Cursor’s “Open in browser” or go to `http://localhost:8000/docs` (or your instance URL).
+
+### Option 3: Local Development (manual steps)
 Use a virtual environment so dependencies don't install globally:
 
 ```bash
@@ -44,8 +53,9 @@ python -m venv .venv
 # Install dependencies
 pip install -r requirements.txt
 
-# Start Redis
+# Start Redis (no sudo: use scripts/start-redis.sh if you built Redis in redis-build/)
 redis-server &
+# Or: ./scripts/start-redis.sh
 
 # Start Celery worker
 celery -A app.workers.celery_app worker --loglevel=info &

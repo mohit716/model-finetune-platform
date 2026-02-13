@@ -25,5 +25,6 @@ celery_app.conf.update(
     task_time_limit=90000,               # 25h hard limit
 )
 
-# Auto-discover tasks
+# Auto-discover tasks (finds tasks.py) and explicitly load trainer so run_finetuning is registered
 celery_app.autodiscover_tasks(["app.workers"])
+from app.workers import trainer  # noqa: F401

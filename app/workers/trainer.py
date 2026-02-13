@@ -247,7 +247,7 @@ def run_finetuning(self, job_id: str):
             model=model,
             args=training_args,
             train_dataset=training_data,
-            processing_class=tokenizer,
+            tokenizer=tokenizer,
             formatting_func=formatting_func,
             max_seq_length=max_seq_length,
             callbacks=[ProgressReporter()],
