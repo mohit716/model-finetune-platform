@@ -1,12 +1,11 @@
 """
 Fine-tuning worker — runs LoRA training via HuggingFace Transformers + PEFT.
 
-This is the heart of the platform. It:
-1. Validates the dataset
-2. Downloads/loads the base model
-3. Applies LoRA configuration
-4. Trains with the SFTTrainer
-5. Saves the adapter and registers the model
+Supports two dataset formats:
+  - "instruction": {"instruction", "input?", "output"}
+  - "chat": {"messages": [{role, content}, ...]}  (OpenAI-style)
+
+For chat format, loss is masked so only assistant tokens contribute.
 """
 
 import os
@@ -14,6 +13,7 @@ import json
 import time
 import traceback
 from datetime import datetime, timezone
+from typing import Tuple
 from loguru import logger
 
 from app.workers.celery_app import celery_app
@@ -99,8 +99,17 @@ def run_finetuning(self, job_id: str):
 
         # ── 2. LOAD DATASET ──────────────────────────────
         logger.info("Loading and validating dataset...")
-        training_data = load_and_validate_dataset(dataset_path)
+        ds_format = config.get("dataset_format", "auto")
+        if ds_format == "auto":
+            ds_format = detect_dataset_format(dataset_path)
+        logger.info(f"Dataset format: {ds_format}")
+
+        training_data, dataset_stats = load_and_validate_dataset(
+            dataset_path, fmt=ds_format, config=config,
+        )
         logger.info(f"Dataset loaded: {len(training_data)} samples")
+
+        update_job(job_id, metrics={"dataset_stats": dataset_stats})
 
         # ── 3. DOWNLOAD MODEL ────────────────────────────
         update_job(job_id, status=JobStatus.DOWNLOADING)
@@ -146,6 +155,13 @@ def run_finetuning(self, job_id: str):
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         )
         model.config.use_cache = False
+
+        # Enable gradient checkpointing to slash activation memory (~50% savings)
+        if config.get("gradient_checkpointing", True) and hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            logger.info("Gradient checkpointing enabled")
 
         # ── 4. CONFIGURE LoRA ────────────────────────────
         update_job(job_id, status=JobStatus.TRAINING)
@@ -209,28 +225,6 @@ def run_finetuning(self, job_id: str):
         # Format dataset for SFTTrainer
         max_seq_length = config.get("max_seq_length", settings.MAX_SEQ_LENGTH)
 
-        def formatting_func(examples):
-            """Format each example into the chat/instruct template."""
-            texts = []
-            for i in range(len(examples["instruction"])):
-                instruction = examples["instruction"][i]
-                inp = examples.get("input", [""] * len(examples["instruction"]))[i]
-                output = examples["output"][i]
-
-                if inp:
-                    text = (
-                        f"### Instruction:\n{instruction}\n\n"
-                        f"### Input:\n{inp}\n\n"
-                        f"### Response:\n{output}"
-                    )
-                else:
-                    text = (
-                        f"### Instruction:\n{instruction}\n\n"
-                        f"### Response:\n{output}"
-                    )
-                texts.append(text)
-            return texts
-
         # ── 6. TRAIN ─────────────────────────────────────
         logger.info(f"Starting training: {num_epochs} epochs, {total_steps} steps")
 
@@ -243,15 +237,70 @@ def run_finetuning(self, job_id: str):
                 if logs and state:
                     progress_cb.on_log(logs, state.global_step, state.epoch or 0)
 
-        trainer = SFTTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=training_data,
-            tokenizer=tokenizer,
-            formatting_func=formatting_func,
-            max_seq_length=max_seq_length,
-            callbacks=[ProgressReporter()],
-        )
+        if ds_format == "chat":
+            # ── Chat path: apply_chat_template + assistant-only loss ──
+            from trl import DataCollatorForCompletionOnlyLM
+
+            _tok = tokenizer  # closure
+
+            def chat_formatting_func(examples):
+                texts = []
+                for msgs in examples["messages"]:
+                    msgs = _fit_messages_to_length(msgs, _tok, max_seq_length)
+                    texts.append(
+                        _tok.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=False
+                        )
+                    )
+                return texts
+
+            resp_ids = _build_response_template_ids(tokenizer)
+            data_collator = DataCollatorForCompletionOnlyLM(
+                response_template=resp_ids,
+                tokenizer=tokenizer,
+            )
+
+            trainer = SFTTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=training_data,
+                tokenizer=tokenizer,
+                formatting_func=chat_formatting_func,
+                data_collator=data_collator,
+                max_seq_length=max_seq_length,
+                callbacks=[ProgressReporter()],
+            )
+        else:
+            # ── Instruction path (original) ──────────────
+            def instruction_formatting_func(examples):
+                texts = []
+                for i in range(len(examples["instruction"])):
+                    instruction = examples["instruction"][i]
+                    inp = examples.get("input", [""] * len(examples["instruction"]))[i]
+                    output = examples["output"][i]
+                    if inp:
+                        text = (
+                            f"### Instruction:\n{instruction}\n\n"
+                            f"### Input:\n{inp}\n\n"
+                            f"### Response:\n{output}"
+                        )
+                    else:
+                        text = (
+                            f"### Instruction:\n{instruction}\n\n"
+                            f"### Response:\n{output}"
+                        )
+                    texts.append(text)
+                return texts
+
+            trainer = SFTTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=training_data,
+                tokenizer=tokenizer,
+                formatting_func=instruction_formatting_func,
+                max_seq_length=max_seq_length,
+                callbacks=[ProgressReporter()],
+            )
 
         train_result = trainer.train()
 
@@ -274,6 +323,8 @@ def run_finetuning(self, job_id: str):
             "total_steps": train_result.metrics.get("train_steps", 0),
             "trainable_params": trainable_params,
             "total_params": all_params,
+            "dataset_format": ds_format,
+            "dataset_stats": dataset_stats,
         }
 
         # Calculate adapter size
@@ -285,6 +336,9 @@ def run_finetuning(self, job_id: str):
 
         # ── 8. REGISTER MODEL ────────────────────────────
         logger.info("Registering fine-tuned model...")
+        model_config = dict(config)
+        model_config["dataset_format"] = ds_format
+
         model_record = FineTunedModel(
             name=f"{job.name}_model",
             base_model=job.base_model,
@@ -292,7 +346,7 @@ def run_finetuning(self, job_id: str):
             status=ModelStatus.READY,
             adapter_path=adapter_storage_key,
             metrics=metrics,
-            config=config,
+            config=model_config,
             size_bytes=adapter_size,
         )
         db.add(model_record)
@@ -345,11 +399,45 @@ def run_finetuning(self, job_id: str):
 
 # ── Helper Functions ─────────────────────────────────────
 
-def load_and_validate_dataset(file_path: str):
-    """Load a JSONL dataset and validate its structure."""
+
+def detect_dataset_format(file_path: str) -> str:
+    """Peek at the first valid line to decide 'chat' vs 'instruction'."""
+    with open(file_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if "messages" in record:
+                return "chat"
+            if "instruction" in record:
+                return "instruction"
+            raise ValueError(
+                "Unrecognised format: first row needs 'messages' or 'instruction'"
+            )
+    raise ValueError("Dataset file is empty")
+
+
+def load_and_validate_dataset(file_path: str, fmt: str = "instruction",
+                              config: dict | None = None) -> Tuple:
+    """
+    Load JSONL and return (HFDataset, stats_dict).
+
+    Dispatches to instruction or chat loader based on *fmt*.
+    """
+    if fmt == "chat":
+        return _load_chat_dataset(file_path, config or {})
+    return _load_instruction_dataset(file_path)
+
+
+# ── Instruction format ───────────────────────────────────
+
+def _load_instruction_dataset(file_path: str) -> Tuple:
     from datasets import Dataset as HFDataset
 
-    records = []
+    records, dropped = [], 0
+    output_lens = []
+
     with open(file_path, "r") as f:
         for i, line in enumerate(f):
             line = line.strip()
@@ -358,23 +446,206 @@ def load_and_validate_dataset(file_path: str):
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
-                raise ValueError(f"Invalid JSON on line {i + 1}")
-
+                dropped += 1
+                continue
             if "instruction" not in record or "output" not in record:
-                raise ValueError(
-                    f"Line {i + 1} missing required fields: 'instruction' and 'output'"
-                )
+                dropped += 1
+                continue
+
             records.append({
                 "instruction": record["instruction"],
                 "input": record.get("input", ""),
                 "output": record["output"],
             })
+            output_lens.append(len(record["output"]))
 
-    if len(records) < 1:
-        raise ValueError("Dataset must contain at least 1 sample")
+    if not records:
+        raise ValueError("Dataset must contain at least 1 valid sample")
 
-    logger.info(f"Validated {len(records)} samples")
-    return HFDataset.from_list(records)
+    stats = {
+        "format": "instruction",
+        "total_rows": len(records) + dropped,
+        "valid_rows": len(records),
+        "dropped_rows": dropped,
+        "avg_assistant_chars": round(sum(output_lens) / len(output_lens)),
+        "max_assistant_chars": max(output_lens),
+    }
+    logger.info(f"Instruction dataset: {stats}")
+    return HFDataset.from_list(records), stats
+
+
+# ── Chat format ──────────────────────────────────────────
+
+_REQUIRED_ROLES = ("system", "user", "assistant")
+
+
+def _load_chat_dataset(file_path: str, config: dict) -> Tuple:
+    """
+    Load OpenAI-style chat JSONL.
+
+    Validates:
+      - Exactly 3 messages with roles [system, user, assistant]
+      - Non-empty assistant content
+      - Optional char-length filters from config
+    Returns (HFDataset, stats).
+    """
+    from datasets import Dataset as HFDataset
+
+    max_user = config.get("max_user_chars")
+    max_asst = config.get("max_assistant_chars")
+
+    records, dropped = [], 0
+    user_lens, asst_lens = [], []
+
+    with open(file_path, "r") as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                dropped += 1
+                continue
+
+            msgs = record.get("messages")
+            if not isinstance(msgs, list) or len(msgs) != 3:
+                dropped += 1
+                continue
+
+            roles = tuple(m.get("role") for m in msgs)
+            if roles != _REQUIRED_ROLES:
+                dropped += 1
+                continue
+
+            sys_c = (msgs[0].get("content") or "").strip()
+            usr_c = (msgs[1].get("content") or "").strip()
+            ast_c = (msgs[2].get("content") or "").strip()
+
+            if not ast_c:
+                dropped += 1
+                continue
+
+            if max_user and len(usr_c) > max_user:
+                dropped += 1
+                continue
+            if max_asst and len(ast_c) > max_asst:
+                dropped += 1
+                continue
+
+            records.append({
+                "messages": [
+                    {"role": "system", "content": sys_c},
+                    {"role": "user", "content": usr_c},
+                    {"role": "assistant", "content": ast_c},
+                ]
+            })
+            user_lens.append(len(usr_c))
+            asst_lens.append(len(ast_c))
+
+    if not records:
+        raise ValueError(
+            f"No valid chat samples (checked {dropped + len(records)} lines, "
+            f"dropped {dropped})"
+        )
+
+    stats = {
+        "format": "chat",
+        "total_rows": len(records) + dropped,
+        "valid_rows": len(records),
+        "dropped_rows": dropped,
+        "avg_user_chars": round(sum(user_lens) / len(user_lens)),
+        "max_user_chars": max(user_lens),
+        "avg_assistant_chars": round(sum(asst_lens) / len(asst_lens)),
+        "max_assistant_chars": max(asst_lens),
+    }
+    logger.info(f"Chat dataset: {stats}")
+    return HFDataset.from_list(records), stats
+
+
+def _fit_messages_to_length(messages: list, tokenizer, max_seq_length: int) -> list:
+    """
+    If the tokenised conversation exceeds *max_seq_length*, trim the **user**
+    message from the tail first.  Only touches assistant as a last resort.
+    """
+    full = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+    n_tok = len(tokenizer.encode(full, add_special_tokens=False))
+    if n_tok <= max_seq_length:
+        return messages
+
+    excess = n_tok - max_seq_length
+    trim_chars = int(excess * 4) + 40  # conservative char estimate
+
+    usr = messages[1]["content"]
+    if len(usr) - trim_chars >= 80:
+        return [
+            messages[0],
+            {"role": "user", "content": usr[: len(usr) - trim_chars].rstrip() + " ..."},
+            messages[2],
+        ]
+
+    # User too short to absorb all excess — keep 80 chars, trim assistant tail
+    remaining = trim_chars - (len(usr) - 80)
+    ast = messages[2]["content"]
+    return [
+        messages[0],
+        {"role": "user", "content": usr[:80].rstrip() + " ..."},
+        {"role": "assistant", "content": ast[: max(60, len(ast) - remaining)].rstrip()},
+    ]
+
+
+def _build_response_template_ids(tokenizer) -> list[int]:
+    """
+    Auto-detect the token-ID sequence that marks the beginning of the
+    assistant turn in this tokenizer's chat template.
+
+    Works by tokenizing two probe conversations with different assistant
+    content, finding where the token IDs diverge, and extracting the
+    assistant-header tokens just before the divergence point.
+    This avoids tokenization boundary issues with standalone encoding.
+    """
+    probe_a = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "U"},
+        {"role": "assistant", "content": "AAAA"},
+    ]
+    probe_b = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "U"},
+        {"role": "assistant", "content": "BBBB"},
+    ]
+
+    text_a = tokenizer.apply_chat_template(
+        probe_a, tokenize=False, add_generation_prompt=False
+    )
+    text_b = tokenizer.apply_chat_template(
+        probe_b, tokenize=False, add_generation_prompt=False
+    )
+    ids_a = tokenizer.encode(text_a, add_special_tokens=False)
+    ids_b = tokenizer.encode(text_b, add_special_tokens=False)
+
+    diverge = 0
+    for i in range(min(len(ids_a), len(ids_b))):
+        if ids_a[i] != ids_b[i]:
+            diverge = i
+            break
+
+    if diverge < 2:
+        raise ValueError(
+            "Could not detect assistant response template — "
+            "tokenizer may not have a chat_template."
+        )
+
+    n_ctx = min(4, diverge)
+    ids = ids_a[diverge - n_ctx: diverge]
+
+    logger.info(
+        f"Response template ({n_ctx} tokens): {ids} → "
+        f"{repr(tokenizer.decode(ids))}"
+    )
+    return ids
 
 
 def _detect_target_modules(model) -> list:
@@ -384,11 +655,10 @@ def _detect_target_modules(model) -> list:
     target_names = set()
     for name, module in model.named_modules():
         if isinstance(module, (nn.Linear,)):
-            # Get the last part of the name (e.g., "q_proj" from "model.layers.0.self_attn.q_proj")
             short_name = name.split(".")[-1]
-            if short_name not in ("lm_head",):  # Skip output head
+            if short_name not in ("lm_head",):
                 target_names.add(short_name)
 
     targets = list(target_names)
     logger.info(f"Auto-detected LoRA target modules: {targets}")
-    return targets if targets else ["q_proj", "v_proj"]  # Fallback
+    return targets if targets else ["q_proj", "v_proj"]

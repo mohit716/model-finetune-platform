@@ -21,7 +21,24 @@ class TrainingConfig(BaseModel):
     weight_decay: float = Field(default=0.01, ge=0.0)
     gradient_accumulation_steps: int = Field(default=4, ge=1)
     fp16: bool = True
-    lora_target_modules: Optional[List[str]] = None  # Auto-detected if None
+    lora_target_modules: Optional[List[str]] = None
+
+    gradient_checkpointing: bool = Field(
+        default=True,
+        description="Trade ~30% speed for ~50% less VRAM (required for 8B+ on T4)",
+    )
+    dataset_format: str = Field(
+        default="auto",
+        description="'auto' detects from data, 'instruction', or 'chat'",
+    )
+    max_user_chars: Optional[int] = Field(
+        default=None, ge=1,
+        description="Drop rows where combined user content exceeds this",
+    )
+    max_assistant_chars: Optional[int] = Field(
+        default=None, ge=1,
+        description="Drop rows where assistant content exceeds this",
+    )
 
 
 # ── Job Schemas ──────────────────────────────────────────
@@ -31,6 +48,18 @@ class JobCreate(BaseModel):
     base_model: str = Field(default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     dataset_id: str
     config: TrainingConfig = TrainingConfig()
+
+
+class DatasetStats(BaseModel):
+    """Reported after validation inside the training worker."""
+    format: str = "instruction"
+    total_rows: int = 0
+    valid_rows: int = 0
+    dropped_rows: int = 0
+    avg_user_chars: Optional[int] = None
+    max_user_chars: Optional[int] = None
+    avg_assistant_chars: Optional[int] = None
+    max_assistant_chars: Optional[int] = None
 
 
 class JobResponse(BaseModel):

@@ -85,8 +85,17 @@ def run_inference(req: InferenceRequest, db: Session = Depends(get_db)):
     model = loaded["model"]
     tokenizer = loaded["tokenizer"]
 
-    # Format prompt
-    if req.system_prompt:
+    # Format prompt — use chat template when the model was trained on chat data
+    model_cfg = model_record.config or {}
+    if model_cfg.get("dataset_format") == "chat":
+        messages = []
+        if req.system_prompt:
+            messages.append({"role": "system", "content": req.system_prompt})
+        messages.append({"role": "user", "content": req.prompt})
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+    elif req.system_prompt:
         formatted_prompt = (
             f"### System:\n{req.system_prompt}\n\n"
             f"### Instruction:\n{req.prompt}\n\n"

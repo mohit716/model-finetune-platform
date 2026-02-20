@@ -19,6 +19,43 @@ from app.config import settings
 router = APIRouter(prefix="/api/v1/datasets", tags=["Datasets"])
 
 
+VALID_CHAT_ROLES = ("system", "user", "assistant")
+
+
+def _detect_and_validate_line(record: dict, line_num: int) -> str:
+    """Return 'chat' or 'instruction' for a parsed JSON record, or raise."""
+    if "messages" in record:
+        msgs = record["messages"]
+        if not isinstance(msgs, list) or len(msgs) != 3:
+            raise HTTPException(
+                400,
+                f"Line {line_num}: 'messages' must be a list of exactly 3 items "
+                f"(system, user, assistant)",
+            )
+        roles = tuple(m.get("role") for m in msgs)
+        if roles != VALID_CHAT_ROLES:
+            raise HTTPException(
+                400,
+                f"Line {line_num}: roles must be {VALID_CHAT_ROLES}, got {roles}",
+            )
+        for m in msgs:
+            if not isinstance(m.get("content"), str) or not m["content"].strip():
+                raise HTTPException(
+                    400,
+                    f"Line {line_num}: every message must have non-empty 'content'",
+                )
+        return "chat"
+
+    if "instruction" in record and "output" in record:
+        return "instruction"
+
+    raise HTTPException(
+        400,
+        f"Line {line_num}: must contain 'messages' (chat) or "
+        f"'instruction'+'output' (instruction)",
+    )
+
+
 @router.post("/upload", response_model=DatasetResponse, status_code=201)
 async def upload_dataset(
     file: UploadFile = File(...),
@@ -28,19 +65,19 @@ async def upload_dataset(
     """
     Upload a training dataset (JSONL format).
 
-    Each line should be a JSON object with:
-    - "instruction" (required): The task instruction
-    - "input" (optional): Additional context
-    - "output" (required): The expected response
+    Supports two formats (do NOT mix within one file):
+      Chat:        {"messages": [{"role":"system","content":"..."},
+                                  {"role":"user","content":"..."},
+                                  {"role":"assistant","content":"..."}]}
+      Instruction: {"instruction":"...", "output":"...", "input":"..."}
     """
-    # Validate file extension
     if not file.filename.endswith((".jsonl", ".json")):
         raise HTTPException(400, "Only .jsonl and .json files are supported")
 
-    # Read and validate content
     content = await file.read()
     lines = content.decode("utf-8").strip().split("\n")
     num_samples = 0
+    detected_format = None
 
     for i, line in enumerate(lines):
         line = line.strip()
@@ -51,20 +88,24 @@ async def upload_dataset(
         except json.JSONDecodeError:
             raise HTTPException(400, f"Invalid JSON on line {i + 1}")
 
-        if "instruction" not in record:
-            raise HTTPException(400, f"Line {i + 1}: missing 'instruction' field")
-        if "output" not in record:
-            raise HTTPException(400, f"Line {i + 1}: missing 'output' field")
+        row_fmt = _detect_and_validate_line(record, i + 1)
+
+        if detected_format is None:
+            detected_format = row_fmt
+        elif row_fmt != detected_format:
+            raise HTTPException(
+                400,
+                f"Line {i + 1}: mixed formats — file started as '{detected_format}' "
+                f"but this line is '{row_fmt}'. Use one format per file.",
+            )
         num_samples += 1
 
     if num_samples == 0:
         raise HTTPException(400, "Dataset is empty")
 
-    # Save file
     dataset_id = str(uuid.uuid4())
     file_key = f"datasets/{dataset_id}/{file.filename}"
 
-    # Write to temp then store (cross-platform temp dir)
     fd, tmp_path = tempfile.mkstemp(suffix=file.filename)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -76,7 +117,6 @@ async def upload_dataset(
         except OSError:
             pass
 
-    # Create DB record
     dataset = Dataset(
         id=dataset_id,
         name=name,
@@ -84,12 +124,16 @@ async def upload_dataset(
         file_size=len(content),
         num_samples=num_samples,
         format="jsonl",
+        metadata_={"content_format": detected_format},
     )
     db.add(dataset)
     db.commit()
     db.refresh(dataset)
 
-    logger.info(f"Dataset uploaded: {name} ({num_samples} samples, {len(content)} bytes)")
+    logger.info(
+        f"Dataset uploaded: {name} ({num_samples} samples, "
+        f"format={detected_format}, {len(content)} bytes)"
+    )
     return dataset
 
 
